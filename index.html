@@ -2,724 +2,465 @@
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>Cascata POP — Runner Doodle</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Cascata POP - Prototype</title>
   <style>
-    html, body { margin:0; padding:0; height:100%; background:#0b0b10; overflow:hidden; }
-    canvas { display:block; width:100dvw; height:100dvh; touch-action:none; }
+    html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#000; touch-action:none; }
+    canvas { display:block; width:100vw; height:100vh; }
   </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 
 <script>
-(() => {
-  const canvas = document.getElementById('c');
-  const ctx = canvas.getContext('2d', { alpha:false });
+/**
+ * PROTOTIPO "CASCATA POP"
+ * - Sfondo immagine (NON modificato) + oggetti che scendono in 5 corsie
+ * - Player piccolo in basso: selezionabile via tasti 1/2/3 (bimbo/bimba/coniglio)
+ * - Controlli: trascina col dito per spostarti di corsia (o frecce sx/dx)
+ * - Buoni: punti, Cattivi: perdi vita
+ */
 
-  const DPR = Math.min(2, window.devicePixelRatio || 1);
-  function resize(){
-    const vw = document.documentElement.clientWidth;
-    const vh = document.documentElement.clientHeight;
-    canvas.width  = Math.floor(vw * DPR);
-    canvas.height = Math.floor(vh * DPR);
+// ====== CONFIG BASE ======
+const BG_SRC = "bg.png";      // <-- metti il tuo sfondo qui (stessa cartella)
+const LANES = 5;
+
+const cfg = {
+  // prospettiva corsie (convergenza verso l'alto)
+  topY: 0.20,           // dove "nascono" gli oggetti (parte bianca in alto)
+  bottomY: 0.90,        // dove sta il player
+  topSpread: 0.18,      // quanto sono "vicine" le corsie in alto (0.10..0.25)
+  bottomLeft: 0.12,     // area pavimento in basso
+  bottomRight: 0.88,
+
+  // gameplay
+  spawnEveryMs: 650,
+  baseSpeed: 0.42,      // più alto = più veloce
+  speedRamp: 0.00006,   // aumenta nel tempo (difficoltà)
+  goodChance: 0.62,     // % buoni
+  lives: 3,
+
+  // hit window vicino al player
+  hitT: 0.93,
+  hitWindow: 0.055,
+
+  // debug
+  debugLanes: false
+};
+
+// ====== CANVAS SETUP ======
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function resize() {
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  canvas.width  = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener("resize", resize);
+resize();
+
+// ====== UTILS ======
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp = (a,b,t)=>a+(b-a)*t;
+const easeIn = (t)=>t*t;
+
+function laneX(laneIndex, tNorm, w) {
+  // tNorm: 0 in alto -> 1 in basso
+  const r = (LANES===1) ? 0.5 : laneIndex/(LANES-1);
+  const topCenter = 0.5;
+  const topLeft  = topCenter - cfg.topSpread/2;
+  const topRight = topCenter + cfg.topSpread/2;
+
+  const xTop = lerp(topLeft*w, topRight*w, r);
+  const xBot = lerp(cfg.bottomLeft*w, cfg.bottomRight*w, r);
+  return lerp(xTop, xBot, tNorm);
+}
+
+function yFromT(tNorm, h) {
+  // spingo un po' con easing per dare feeling "vengono verso di te"
+  const t = easeIn(clamp(tNorm, 0, 1));
+  return lerp(cfg.topY*h, cfg.bottomY*h, t);
+}
+
+function scaleFromT(tNorm) {
+  // piccolo in alto, grande in basso
+  return lerp(0.35, 1.05, clamp(tNorm,0,1));
+}
+
+function nearestLaneAtBottom(x, w) {
+  let best = 0, bestD = Infinity;
+  for (let i=0;i<LANES;i++) {
+    const lx = laneX(i, 1, w);
+    const d = Math.abs(x - lx);
+    if (d < bestD) { bestD = d; best = i; }
   }
-  addEventListener('resize', resize);
-  resize();
+  return best;
+}
 
-  // ===== helpers
-  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
-  const lerp  = (a,b,t)=>a+(b-a)*t;
-  const rand  = (a,b)=>a+Math.random()*(b-a);
+// ====== ASSETS ======
+const bgImg = new Image();
+bgImg.src = BG_SRC;
+let bgReady = false;
+bgImg.onload = ()=> bgReady = true;
+bgImg.onerror = ()=> {
+  // se non trova bg.png, almeno non crasha
+  bgReady = false;
+  console.warn("Sfondo non trovato. Metti bg.png nella stessa cartella di index.html");
+};
 
-  function aabb(ax,ay,aw,ah,bx,by,bw,bh){
-    return !(ax+aw<bx || ax>bx+bw || ay+ah<by || ay>by+bh);
-  }
+// ====== GAME STATE ======
+let started = false;
+let lastTs = 0;
+let elapsed = 0;
 
-  // roundRect compat
-  function rr(x,y,w,h,r){
-    r = Math.max(0, Math.min(r, w/2, h/2));
+const state = {
+  score: 0,
+  lives: cfg.lives,
+  playerLane: 2,
+  playerSkin: "bunny", // "boy" | "girl" | "bunny"
+  obstacles: [],
+  nextSpawn: 0
+};
+
+function resetGame() {
+  state.score = 0;
+  state.lives = cfg.lives;
+  state.playerLane = 2;
+  state.obstacles = [];
+  elapsed = 0;
+  lastTs = 0;
+  state.nextSpawn = 0;
+}
+
+// ====== DRAW: PLAYER & OBSTACLES (semplici, senza cambiare sfondo) ======
+function drawKawaiiFace(x, y, r) {
+  // occhi
+  ctx.fillStyle = "rgba(0,0,0,0.85)";
+  ctx.beginPath(); ctx.arc(x - r*0.35, y - r*0.10, r*0.10, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + r*0.35, y - r*0.10, r*0.10, 0, Math.PI*2); ctx.fill();
+  // puntini luce
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.beginPath(); ctx.arc(x - r*0.32, y - r*0.14, r*0.04, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + r*0.38, y - r*0.14, r*0.04, 0, Math.PI*2); ctx.fill();
+  // bocca
+  ctx.strokeStyle = "rgba(0,0,0,0.75)";
+  ctx.lineWidth = Math.max(1, r*0.06);
+  ctx.beginPath();
+  ctx.arc(x, y + r*0.08, r*0.18, 0.15*Math.PI, 0.85*Math.PI);
+  ctx.stroke();
+}
+
+function drawPlayer(x, y, s, skin) {
+  const r = 18 * s;
+  ctx.save();
+  ctx.translate(x, y);
+
+  if (skin === "boy" || skin === "girl") {
+    // testolina + cuffie
+    ctx.fillStyle = "rgba(255,240,220,0.95)";
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
+
+    // capelli
+    ctx.fillStyle = (skin==="girl") ? "rgba(230,200,80,0.95)" : "rgba(120,70,30,0.95)";
     ctx.beginPath();
-    if (ctx.roundRect) {
-      ctx.roundRect(x,y,w,h,r);
-    } else {
-      ctx.moveTo(x+r,y);
-      ctx.arcTo(x+w,y,x+w,y+h,r);
-      ctx.arcTo(x+w,y+h,x,y+h,r);
-      ctx.arcTo(x,y+h,x,y,r);
-      ctx.arcTo(x,y,x+w,y,r);
-      ctx.closePath();
-    }
-  }
-
-  // ===== palette (doodle style come immagine)
-  const PAL = {
-    bg:'#fffdf8',
-    ink:'rgba(25,25,35,0.92)',
-    softInk:'rgba(25,25,35,0.35)',
-    shadow:'rgba(0,0,0,0.10)',
-
-    ground:'#f3efe6',
-    ground2:'#efe7d9',
-
-    star:'#ffd56a',
-    donut:'#ffb3c7',
-    carrot:'#ffa45a',
-    mint:'#9bf2c5',
-    bunny:'#ffffff',
-    bunny2:'#f0eef6',
-
-    stain:'#9ce1ff',
-    receipt:'#ffffff'
-  };
-
-  // ===== tiny audio (optional)
-  class Snd {
-    constructor(){ this.ctx=null; this.g=null; this.cool=0; }
-    ensure(){
-      if(this.ctx) return;
-      const AC = window.AudioContext||window.webkitAudioContext;
-      if(!AC) return;
-      this.ctx = new AC();
-      this.g = this.ctx.createGain();
-      this.g.gain.value = 0.16;
-      this.g.connect(this.ctx.destination);
-    }
-    tone(f=440,d=0.08,g=0.06,type='sine'){
-      if(!this.ctx) return;
-      const t0=this.ctx.currentTime;
-      const o=this.ctx.createOscillator();
-      const ga=this.ctx.createGain();
-      o.type=type;
-      o.frequency.setValueAtTime(f,t0);
-      ga.gain.setValueAtTime(0.0001,t0);
-      ga.gain.exponentialRampToValueAtTime(g,t0+0.01);
-      ga.gain.exponentialRampToValueAtTime(0.0001,t0+d);
-      o.connect(ga); ga.connect(this.g);
-      o.start(t0); o.stop(t0+d+0.02);
-    }
-    star(){ this.tone(rand(520,760),0.07,0.06,'sine'); this.tone(rand(980,1280),0.05,0.03,'triangle'); }
-    hit(){ this.tone(rand(140,190),0.14,0.07,'square'); }
-    choice(){ this.tone(rand(320,420),0.08,0.05,'triangle'); this.tone(rand(520,680),0.07,0.04,'sine'); }
-  }
-  const S = new Snd();
-
-  // ===== game state
-  const G = {
-    last: performance.now(),
-    t: 0,
-    state: 'idle', // idle | play | over
-
-    score: 0,
-    lives: 3,
-
-    speed: 460 * DPR,
-    speedMax: 980 * DPR,
-
-    groundY: 0,
-    groundH: 0,
-    scroll: 0,
-
-    p: { x:0, y:0, w:0, h:0, vy:0, onGround:true, coyote:0, jumpBuf:0, cut:false, puff:22 },
-
-    stars: [],
-    bads: [],
-
-    // spawner
-    spawnStar: 0.45,
-    spawnBad: 1.05,
-
-    // choice pair (2 bolle grandi: alta/bassa)
-    choiceTimer: 3.2,
-    choiceActive: null
-  };
-
-  function reset(){
-    const W=canvas.width, H=canvas.height;
-    G.t=0;
-    G.state='idle';
-    G.score=0;
-    G.lives=3;
-
-    G.speed = 460 * DPR;
-    G.groundH = Math.max(76*DPR, H*0.18);
-    // in landscape alza un filo il terreno per “runner” più bello
-    const land = (W > H);
-    G.groundY = land ? Math.floor(H*0.78) : (H - G.groundH);
-
-    G.scroll=0;
-
-    G.p.w = 84*DPR;
-    G.p.h = 84*DPR;
-    G.p.x = W * 0.22;
-    G.p.y = G.groundY - G.p.h;
-    G.p.vy = 0;
-    G.p.onGround = true;
-    G.p.coyote = 0.12;
-    G.p.jumpBuf = 0;
-    G.p.cut = false;
-    G.p.puff = 22;
-
-    G.stars.length=0;
-    G.bads.length=0;
-
-    G.spawnStar = 0.38;
-    G.spawnBad = 0.95;
-
-    G.choiceTimer = 3.2;
-    G.choiceActive = null;
-  }
-  reset();
-
-  // ===== input (tap jump)
-  function requestJump(){
-    G.p.jumpBuf = 0.16;
-    G.p.cut = false;
-  }
-  function doJump(){
-    const p=G.p;
-    p.vy = -840 * DPR;
-    p.onGround = false;
-    p.coyote = 0;
-    p.jumpBuf = 0;
-  }
-
-  canvas.addEventListener('pointerdown', (e)=>{
-    S.ensure();
-    if(G.state !== 'play'){
-      reset();
-      G.state='play';
-      return;
-    }
-    requestJump();
-  });
-
-  addEventListener('pointerup', ()=>{
-    // jump cut: se molli subito, salto più corto (piace ai bimbi perché “controllo”)
-    G.p.cut = true;
-  });
-
-  // ===== doodle drawing primitives (contorni + faccine)
-  function face(x,y,s){
-    ctx.fillStyle = PAL.ink;
-    ctx.beginPath(); ctx.ellipse(x - s*0.22, y, s*0.06, s*0.08, 0, 0, Math.PI*2); ctx.fill();
-    ctx.beginPath(); ctx.ellipse(x + s*0.22, y, s*0.06, s*0.08, 0, 0, Math.PI*2); ctx.fill();
-
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.2*DPR);
-    ctx.beginPath();
-    ctx.arc(x, y + s*0.12, s*0.14, 0, Math.PI);
-    ctx.stroke();
-  }
-
-  function bg(){
-    const W=canvas.width, H=canvas.height;
-    ctx.fillStyle = PAL.bg;
-    ctx.fillRect(0,0,W,H);
-
-    // pattern doodle leggerissimo (come foglio)
-    ctx.globalAlpha = 0.12;
-    ctx.strokeStyle = PAL.softInk;
-    ctx.lineWidth = Math.max(1, 1.2*DPR);
-    for(let i=0;i<18;i++){
-      const x = ((i*97 + G.t*48) % (W+140)) - 70;
-      const y = (i*57) % (H*0.70);
-      ctx.beginPath();
-      ctx.arc(x, y, 10*DPR, 0, Math.PI*2);
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  function ground(){
-    const W=canvas.width, H=canvas.height;
-
-    ctx.fillStyle = PAL.ground;
-    ctx.fillRect(0, G.groundY, W, H-G.groundY);
-
-    // “corsa”: strisce che scorrono
-    const stripeW = 72*DPR;
-    const gap = 24*DPR;
-    const y = G.groundY + (H-G.groundY)*0.20;
-    const h = Math.max(10*DPR, (H-G.groundY)*0.18);
-
-    const off = (G.scroll % (stripeW+gap));
-    for(let x=-off; x<W+stripeW; x += (stripeW+gap)){
-      ctx.globalAlpha = 0.65;
-      ctx.fillStyle = PAL.ground2;
-      rr(x, y, stripeW, h, 18*DPR);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    // linea di separazione soft
-    ctx.strokeStyle = PAL.softInk;
-    ctx.lineWidth = Math.max(2, 2.2*DPR);
-    ctx.beginPath();
-    ctx.moveTo(0, G.groundY);
-    ctx.lineTo(W, G.groundY);
-    ctx.stroke();
-  }
-
-  function drawBunny(){
-    const p=G.p;
-    const x=p.x, y=p.y, w=p.w, h=p.h;
-    const bob = 1 + 0.03*Math.sin(G.t*10);
-
-    // ombra
-    ctx.globalAlpha = 0.18;
-    ctx.fillStyle = 'black';
-    ctx.beginPath();
-    ctx.ellipse(x+w*0.52, G.groundY + 10*DPR, w*0.42, 10*DPR, 0, 0, Math.PI*2);
+    ctx.arc(0, -r*0.2, r*1.05, Math.PI, 0);
     ctx.fill();
-    ctx.globalAlpha = 1;
 
-    // puff (sedere/codina) che cresce
-    const puff = clamp(p.puff, 0, 100);
-    const puffR = (w*0.12) + puff*0.085*DPR;
+    // cuffie
+    ctx.fillStyle = "rgba(60,220,140,0.95)";
+    ctx.beginPath(); ctx.arc(-r*1.05, 0, r*0.35, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc( r*1.05, 0, r*0.35, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = "rgba(30,30,30,0.7)";
+    ctx.lineWidth = Math.max(2, r*0.12);
+    ctx.beginPath(); ctx.arc(0, -r*0.65, r*1.1, Math.PI*1.05, Math.PI*1.95); ctx.stroke();
 
-    ctx.fillStyle = PAL.bunny2;
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.6*DPR);
-    ctx.beginPath();
-    ctx.ellipse(x+w*0.88, y+h*0.62, puffR, puffR*0.92, 0, 0, Math.PI*2);
-    ctx.fill(); ctx.stroke();
-
-    // corpo
-    ctx.fillStyle = PAL.bunny;
-    ctx.beginPath();
-    ctx.ellipse(x+w*0.52, y+h*0.58, w*0.36, h*0.30, 0, 0, Math.PI*2);
-    ctx.fill(); ctx.stroke();
-
+    drawKawaiiFace(0, 2, r*0.95);
+  } else {
+    // coniglio
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
     // testa
-    ctx.beginPath();
-    ctx.ellipse(x+w*0.48, y+h*0.34, w*0.30, h*0.26, 0, 0, Math.PI*2);
-    ctx.fill(); ctx.stroke();
-
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
     // orecchie
-    ctx.beginPath();
-    ctx.ellipse(x+w*0.38, y+h*0.08, w*0.10, h*0.22*bob, -0.22, 0, Math.PI*2);
-    ctx.ellipse(x+w*0.56, y+h*0.08, w*0.10, h*0.22*bob,  0.22, 0, Math.PI*2);
-    ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(-r*0.55, -r*1.25, r*0.35, r*0.75, -0.15, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse( r*0.55, -r*1.25, r*0.35, r*0.75,  0.15, 0, Math.PI*2); ctx.fill();
+    // interno orecchie
+    ctx.fillStyle = "rgba(255,170,190,0.85)";
+    ctx.beginPath(); ctx.ellipse(-r*0.55, -r*1.22, r*0.18, r*0.55, -0.15, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse( r*0.55, -r*1.22, r*0.18, r*0.55,  0.15, 0, Math.PI*2); ctx.fill();
 
-    // faccina
-    face(x+w*0.48, y+h*0.33, w*0.9);
+    // cuffie
+    ctx.fillStyle = "rgba(80,180,255,0.95)";
+    ctx.beginPath(); ctx.arc(-r*1.00, 0, r*0.32, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc( r*1.00, 0, r*0.32, 0, Math.PI*2); ctx.fill();
+
+    drawKawaiiFace(0, 2, r*0.95);
   }
 
-  // ===== icons (doodle)
-  function drawStar(s){
-    ctx.fillStyle = PAL.star;
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.2*DPR);
+  ctx.restore();
+}
 
-    const pulse = 0.5 + 0.5*Math.sin(s.spin*3);
-    const r = s.r * (1 + pulse*0.08);
+function drawGood(x, y, s) {
+  // "buono" = pallina dolce con faccia
+  const r = 22 * s;
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = "rgba(255,120,170,0.55)";
+  ctx.beginPath(); ctx.arc(x - r*0.5, y + r*0.15, r*0.22, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + r*0.5, y + r*0.15, r*0.22, 0, Math.PI*2); ctx.fill();
+  drawKawaiiFace(x, y, r);
+}
 
-    ctx.beginPath();
-    const spikes=5;
-    for(let i=0;i<spikes*2;i++){
-      const a = (i/(spikes*2))*Math.PI*2 - Math.PI/2;
-      const rr = (i%2===0)? r : r*0.45;
-      const px = s.x + Math.cos(a)*rr;
-      const py = s.y + Math.sin(a)*rr;
-      if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
-    }
-    ctx.closePath();
-    ctx.fill(); ctx.stroke();
+function drawBad(x, y, s) {
+  // "cattivo" = cubo arrabbiato (poliziotto/maestra OK), ma qui lo facciamo neutro senza armi
+  const size = 44 * s;
+  const r = 10 * s;
+  ctx.fillStyle = "rgba(255,200,70,0.95)";
+  roundRect(x - size/2, y - size/2, size, size, r);
+  ctx.fill();
 
-    // faccina piccola
-    face(s.x, s.y + r*0.10, r*1.2);
+  // cappello
+  ctx.fillStyle = "rgba(20,20,20,0.85)";
+  roundRect(x - size*0.35, y - size*0.68, size*0.7, size*0.22, 6*s);
+  ctx.fill();
+
+  // faccia arrabbiata
+  ctx.strokeStyle = "rgba(0,0,0,0.8)";
+  ctx.lineWidth = Math.max(2, 3*s);
+
+  // sopracciglia
+  ctx.beginPath();
+  ctx.moveTo(x - size*0.22, y - size*0.12);
+  ctx.lineTo(x - size*0.02, y - size*0.22);
+  ctx.moveTo(x + size*0.22, y - size*0.12);
+  ctx.lineTo(x + size*0.02, y - size*0.22);
+  ctx.stroke();
+
+  // occhi
+  ctx.fillStyle = "rgba(0,0,0,0.85)";
+  ctx.beginPath(); ctx.arc(x - size*0.16, y - size*0.02, 4*s, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + size*0.16, y - size*0.02, 4*s, 0, Math.PI*2); ctx.fill();
+
+  // bocca
+  ctx.strokeStyle = "rgba(120,0,0,0.85)";
+  ctx.lineWidth = Math.max(2, 4*s);
+  ctx.beginPath();
+  ctx.moveTo(x - size*0.12, y + size*0.15);
+  ctx.lineTo(x + size*0.12, y + size*0.15);
+  ctx.stroke();
+
+  // megafono (solo simbolico, no arma)
+  ctx.fillStyle = "rgba(40,170,255,0.9)";
+  ctx.beginPath();
+  ctx.moveTo(x + size*0.30, y - size*0.05);
+  ctx.lineTo(x + size*0.55, y - size*0.16);
+  ctx.lineTo(x + size*0.55, y + size*0.06);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function roundRect(x, y, w, h, r) {
+  r = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+}
+
+// ====== SPAWN & UPDATE ======
+function spawnObstacle() {
+  const lane = Math.floor(Math.random() * LANES);
+  const isGood = Math.random() < cfg.goodChance;
+  state.obstacles.push({
+    lane,
+    t: 0,              // 0 top -> 1 bottom
+    kind: isGood ? "good" : "bad",
+    taken: false
+  });
+}
+
+function update(dt, w, h) {
+  elapsed += dt;
+
+  // spawn
+  state.nextSpawn -= dt*1000;
+  if (state.nextSpawn <= 0) {
+    spawnObstacle();
+    // un minimo di variabilità
+    const jitter = (Math.random()*140 - 70);
+    state.nextSpawn = Math.max(260, cfg.spawnEveryMs + jitter);
   }
 
-  function drawStain(o){
-    // macchia = blob con faccina
-    ctx.fillStyle = PAL.stain;
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.4*DPR);
+  const speed = cfg.baseSpeed + elapsed * cfg.speedRamp;
 
-    ctx.beginPath();
-    const r = o.w*0.52;
-    ctx.ellipse(o.x+o.w*0.50, o.y+o.h*0.60, r*1.05, r*0.85, 0.2, 0, Math.PI*2);
-    ctx.fill(); ctx.stroke();
-
-    ctx.globalAlpha = 0.18;
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.ellipse(o.x+o.w*0.38, o.y+o.h*0.45, r*0.35, r*0.22, -0.4, 0, Math.PI*2);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-
-    face(o.x+o.w*0.52, o.y+o.h*0.58, o.w*0.9);
+  // move obstacles
+  for (const o of state.obstacles) {
+    o.t += dt * speed;
   }
 
-  function drawReceipt(o){
-    // scontrino = rettangolo + tagli + urlo (maestra “dentro”)
-    ctx.fillStyle = PAL.receipt;
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.4*DPR);
+  // collision vicino al player
+  for (const o of state.obstacles) {
+    if (o.taken) continue;
+    const near = Math.abs(o.t - cfg.hitT) <= cfg.hitWindow;
+    if (!near) continue;
 
-    rr(o.x, o.y, o.w, o.h, 16*DPR);
-    ctx.fill(); ctx.stroke();
-
-    // dentellatura in basso
-    ctx.beginPath();
-    const teeth = 6;
-    for(let i=0;i<=teeth;i++){
-      const xx = o.x + (i/teeth)*o.w;
-      const yy = o.y + o.h;
-      if(i===0) ctx.moveTo(xx, yy);
-      else ctx.lineTo(xx, yy + ((i%2===0)? 10*DPR : 0));
-    }
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.2*DPR);
-    ctx.stroke();
-
-    // righe
-    ctx.globalAlpha = 0.35;
-    ctx.strokeStyle = PAL.softInk;
-    ctx.lineWidth = Math.max(1, 1.4*DPR);
-    for(let i=0;i<4;i++){
-      ctx.beginPath();
-      ctx.moveTo(o.x+12*DPR, o.y+18*DPR+i*16*DPR);
-      ctx.lineTo(o.x+o.w-12*DPR, o.y+18*DPR+i*16*DPR);
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-
-    // faccia arrabbiata + “!!!”
-    ctx.fillStyle = PAL.ink;
-    ctx.beginPath(); ctx.ellipse(o.x+o.w*0.40, o.y+o.h*0.58, o.w*0.04, o.h*0.06, 0, 0, Math.PI*2); ctx.fill();
-    ctx.beginPath(); ctx.ellipse(o.x+o.w*0.60, o.y+o.h*0.58, o.w*0.04, o.h*0.06, 0, 0, Math.PI*2); ctx.fill();
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.2*DPR);
-    ctx.beginPath();
-    ctx.arc(o.x+o.w*0.50, o.y+o.h*0.74, o.w*0.10, Math.PI, Math.PI*2);
-    ctx.stroke();
-
-    // onde/urlo (maestra)
-    ctx.save();
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.2*DPR);
-    const ux = o.x + o.w*0.88;
-    const uy = o.y + o.h*0.48;
-    for(let i=0;i<3;i++){
-      ctx.beginPath();
-      ctx.arc(ux, uy, (10+i*8)*DPR, -0.6, 0.6);
-      ctx.stroke();
-    }
-    // !!!
-    ctx.font = `${Math.floor(18*DPR)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-    ctx.fillText('!!!', o.x+o.w*0.08, o.y+o.h*0.22);
-    ctx.restore();
-  }
-
-  function drawChoiceBubble(b){
-    // bolla grande doodle
-    ctx.fillStyle = '#ffffff';
-    ctx.strokeStyle = PAL.ink;
-    ctx.lineWidth = Math.max(2, 2.8*DPR);
-
-    rr(b.x-b.r*1.15, b.y-b.r*0.95, b.r*2.3, b.r*1.9, b.r*0.55);
-    ctx.fill(); ctx.stroke();
-
-    // highlight
-    ctx.globalAlpha = 0.16;
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.ellipse(b.x - b.r*0.40, b.y - b.r*0.35, b.r*0.55, b.r*0.28, -0.5, 0, Math.PI*2);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-
-    // icona (donut / carrot)
-    if(b.kind === 'donut'){
-      // donut kawaii
-      ctx.fillStyle = PAL.donut;
-      ctx.strokeStyle = PAL.ink;
-      ctx.lineWidth = Math.max(2, 2.4*DPR);
-      ctx.beginPath();
-      ctx.ellipse(b.x, b.y, b.r*0.55, b.r*0.48, 0, 0, Math.PI*2);
-      ctx.fill(); ctx.stroke();
-
-      ctx.fillStyle = PAL.bg;
-      ctx.beginPath();
-      ctx.ellipse(b.x, b.y, b.r*0.22, b.r*0.18, 0, 0, Math.PI*2);
-      ctx.fill(); ctx.stroke();
-
-      face(b.x, b.y + b.r*0.10, b.r*1.1);
-    } else {
-      // carrot kawaii
-      ctx.fillStyle = PAL.carrot;
-      ctx.strokeStyle = PAL.ink;
-      ctx.lineWidth = Math.max(2, 2.4*DPR);
-
-      ctx.beginPath();
-      ctx.moveTo(b.x, b.y - b.r*0.55);
-      ctx.lineTo(b.x - b.r*0.40, b.y + b.r*0.55);
-      ctx.lineTo(b.x + b.r*0.40, b.y + b.r*0.55);
-      ctx.closePath();
-      ctx.fill(); ctx.stroke();
-
-      ctx.fillStyle = PAL.mint;
-      ctx.beginPath();
-      ctx.ellipse(b.x - b.r*0.12, b.y - b.r*0.62, b.r*0.14, b.r*0.22, -0.5, 0, Math.PI*2);
-      ctx.ellipse(b.x + b.r*0.12, b.y - b.r*0.62, b.r*0.14, b.r*0.22,  0.5, 0, Math.PI*2);
-      ctx.fill(); ctx.stroke();
-
-      face(b.x, b.y + b.r*0.10, b.r*1.1);
-    }
-  }
-
-  // ===== spawn
-  function spawnStar(){
-    const W=canvas.width;
-    const r = rand(16,22)*DPR;
-    const yMin = G.groundY - 230*DPR;
-    const yMax = G.groundY - 120*DPR;
-    G.stars.push({ x: W + r*2, y: rand(yMin,yMax), r, spin: rand(0,Math.PI*2) });
-  }
-
-  function spawnBad(){
-    const W=canvas.width;
-    const kind = (Math.random() < 0.55) ? 'stain' : 'receipt';
-    const w = (kind==='stain') ? rand(70,92)*DPR : rand(64,84)*DPR;
-    const h = (kind==='stain') ? rand(46,60)*DPR : rand(86,110)*DPR;
-    const y = (kind==='stain') ? (G.groundY - h*0.65) : (G.groundY - h);
-    G.bads.push({ kind, x: W + w, y, w, h });
-  }
-
-  function spawnChoicePair(){
-    const W=canvas.width;
-    const r = Math.min(70*DPR, Math.max(54*DPR, canvas.height*0.10));
-
-    // due bolle: alta/bassa (scegli saltando o restando)
-    const bx = W + r*2.2;
-    const lowY  = G.groundY - r*0.70;
-    const highY = G.groundY - r*2.25;
-
-    // donut = puff su (più “grasso”), carrot = puff giù (più “snello”)
-    G.choiceActive = {
-      x: bx,
-      r,
-      picked: false,
-      top:  { kind:'donut',  x: bx, y: highY, r },
-      low:  { kind:'carrot', x: bx, y: lowY,  r }
-    };
-  }
-
-  // ===== update
-  function update(dt){
-    const W=canvas.width, H=canvas.height;
-    G.t += dt;
-
-    // speed up
-    G.speed = Math.min(G.speedMax, G.speed + (10*DPR)*dt);
-    G.scroll += G.speed * dt;
-
-    // player physics
-    const p=G.p;
-    const gravity = 2300 * DPR;
-
-    p.jumpBuf = Math.max(0, p.jumpBuf - dt);
-
-    if(p.onGround) p.coyote = 0.12;
-    else p.coyote = Math.max(0, p.coyote - dt);
-
-    if(p.jumpBuf > 0 && p.coyote > 0){
-      doJump();
-    }
-
-    // jump cut (salto più corto se molli)
-    if(p.cut && p.vy < -240*DPR){
-      p.vy *= 0.85;
-      p.cut = false;
-    }
-
-    p.vy += gravity * dt;
-    p.y  += p.vy * dt;
-
-    const groundTop = G.groundY - p.h;
-    if(p.y >= groundTop){
-      p.y = groundTop;
-      p.vy = 0;
-      p.onGround = true;
-    } else {
-      p.onGround = false;
-    }
-
-    // spawner stars/bads
-    G.spawnStar -= dt;
-    if(G.spawnStar <= 0){
-      spawnStar();
-      G.spawnStar = rand(0.34, 0.70);
-    }
-
-    G.spawnBad -= dt;
-    if(G.spawnBad <= 0){
-      spawnBad();
-      // più avanti = più frequente
-      const diff = clamp(G.t/70, 0, 1);
-      G.spawnBad = lerp(1.10, 0.72, diff) * rand(0.85, 1.15);
-    }
-
-    // choice timer
-    G.choiceTimer -= dt;
-    if(G.choiceTimer <= 0 && !G.choiceActive){
-      spawnChoicePair();
-      G.choiceTimer = rand(4.5, 7.0);
-    }
-
-    // move choice pair
-    if(G.choiceActive){
-      const ch = G.choiceActive;
-      ch.x -= G.speed * dt;
-      ch.top.x = ch.x;
-      ch.low.x = ch.x;
-
-      // collision with player (hitbox)
-      const hx = p.x + p.w*0.18, hy = p.y + p.h*0.18, hw = p.w*0.64, hh = p.h*0.70;
-
-      const hitTop = aabb(hx,hy,hw,hh, ch.top.x - ch.top.r*0.90, ch.top.y - ch.top.r*0.75, ch.top.r*1.80, ch.top.r*1.50);
-      const hitLow = aabb(hx,hy,hw,hh, ch.low.x - ch.low.r*0.90, ch.low.y - ch.low.r*0.75, ch.low.r*1.80, ch.low.r*1.50);
-
-      if(hitTop || hitLow){
-        // scelta presa
-        const kind = hitTop ? ch.top.kind : ch.low.kind;
-        if(kind==='donut'){
-          p.puff = Math.min(100, p.puff + 18);
-          G.score += 2;
-        } else {
-          p.puff = Math.max(0, p.puff - 14);
-          G.score += 1;
-          // piccolo premio: rallenta un filo la crescita velocità
-          G.speed = Math.max(420*DPR, G.speed - 40*DPR);
-        }
-        S.choice();
-        G.choiceActive = null;
-      } else if(ch.x < -ch.r*3){
-        // scaduta
-        G.choiceActive = null;
-      }
-    }
-
-    // move stars
-    for(let i=G.stars.length-1;i>=0;i--){
-      const s=G.stars[i];
-      s.x -= (G.speed*1.02) * dt;
-      s.spin += dt*2.0;
-
-      if(s.x < -s.r-50*DPR){ G.stars.splice(i,1); continue; }
-
-      const hit = aabb(
-        p.x+p.w*0.18, p.y+p.h*0.18, p.w*0.64, p.h*0.70,
-        s.x-s.r, s.y-s.r, s.r*2, s.r*2
-      );
-      if(hit){
-        G.stars.splice(i,1);
-        G.score += 1;
-        p.puff = Math.min(100, p.puff + 6);
-        S.star();
-      }
-    }
-
-    // move bads
-    for(let i=G.bads.length-1;i>=0;i--){
-      const o=G.bads[i];
-      o.x -= G.speed * dt;
-
-      if(o.x < -o.w-60*DPR){ G.bads.splice(i,1); continue; }
-
-      // hitbox player
-      const hit = aabb(
-        p.x+p.w*0.18, p.y+p.h*0.18, p.w*0.64, p.h*0.70,
-        o.x, o.y, o.w, o.h
-      );
-      if(hit){
-        G.bads.splice(i,1);
-        G.lives -= 1;
-        p.puff = Math.max(0, p.puff - 12);
-        S.hit();
-        if(G.lives <= 0){
-          G.state = 'over';
+    if (o.lane === state.playerLane) {
+      o.taken = true;
+      if (o.kind === "good") {
+        state.score += 10;
+      } else {
+        state.lives -= 1;
+        if (state.lives <= 0) {
+          started = false; // game over
         }
       }
     }
   }
 
-  // ===== HUD
-  function hud(){
-    const W=canvas.width, H=canvas.height;
+  // cleanup
+  state.obstacles = state.obstacles.filter(o => o.t < 1.15 && !o.taken);
+}
 
+// ====== RENDER ======
+function drawBgCover() {
+  const w = innerWidth, h = innerHeight;
+  if (!bgReady) {
+    // fallback semplice
+    ctx.fillStyle = "#140018";
+    ctx.fillRect(0,0,w,h);
+    return;
+  }
+
+  const iw = bgImg.naturalWidth, ih = bgImg.naturalHeight;
+  const s = Math.max(w/iw, h/ih);
+  const dw = iw*s, dh = ih*s;
+  const dx = (w - dw)/2;
+  const dy = (h - dh)/2;
+  ctx.drawImage(bgImg, dx, dy, dw, dh);
+}
+
+function drawHud() {
+  // niente UI invasiva: solo minimal in alto a sinistra
+  ctx.save();
+  ctx.globalAlpha = 0.75;
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  ctx.fillRect(10, 10, 180, 58);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "white";
+  ctx.font = "16px system-ui, -apple-system, Segoe UI, Roboto";
+  ctx.fillText(`Punti: ${state.score}`, 22, 34);
+  ctx.fillText(`Vite: ${"❤".repeat(Math.max(0,state.lives))}`, 22, 54);
+  ctx.restore();
+}
+
+function drawLanesDebug(w, h) {
+  const yTop = cfg.topY*h;
+  const yBot = cfg.bottomY*h;
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  ctx.lineWidth = 2;
+  for (let i=0;i<LANES;i++) {
+    const x1 = laneX(i, 0, w);
+    const x2 = laneX(i, 1, w);
+    ctx.beginPath();
+    ctx.moveTo(x1, yTop);
+    ctx.lineTo(x2, yBot);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function render() {
+  const w = innerWidth, h = innerHeight;
+  ctx.clearRect(0,0,w,h);
+
+  // sfondo (immutato)
+  drawBgCover();
+
+  if (cfg.debugLanes) drawLanesDebug(w,h);
+
+  // ostacoli
+  for (const o of state.obstacles) {
+    const x = laneX(o.lane, o.t, w);
+    const y = yFromT(o.t, h);
+    const s = scaleFromT(o.t);
+    if (o.kind === "good") drawGood(x, y, s);
+    else drawBad(x, y, s);
+  }
+
+  // player
+  const px = laneX(state.playerLane, 1, w);
+  const py = yFromT(1, h);
+  drawPlayer(px, py, 1.0, state.playerSkin);
+
+  drawHud();
+
+  if (!started) {
+    // "tap to start"
     ctx.save();
-    ctx.fillStyle = PAL.ink;
-    ctx.font = `${Math.floor(18*DPR)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-    ctx.textAlign='left';
-    ctx.textBaseline='top';
-    ctx.fillText(`⭐ ${G.score}`, 12*DPR, 10*DPR);
-    ctx.fillText(`❤️ ${G.lives}`, 12*DPR, 34*DPR);
-
-    // puff bar (mini)
-    const bx=12*DPR, by=60*DPR, bw=140*DPR, bh=10*DPR;
-    ctx.globalAlpha = 0.20;
-    ctx.fillStyle = PAL.ink;
-    rr(bx,by,bw,bh,10*DPR); ctx.fill();
-    ctx.globalAlpha = 1;
-
-    ctx.globalAlpha = 0.85;
-    ctx.fillStyle = PAL.bunny2;
-    rr(bx,by,bw*(clamp(G.p.puff,0,100)/100),bh,10*DPR); ctx.fill();
-    ctx.globalAlpha = 1;
-
-    if(G.state !== 'play'){
-      ctx.textAlign='center';
-      ctx.textBaseline='middle';
-      ctx.font = `${Math.floor(24*DPR)}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
-      const msg = (G.state==='over') ? 'RIPROVA: TOCCA PER RIPARTIRE' : 'TOCCA PER INIZIARE (SALTO)';
-      ctx.fillText(msg, W/2, H*0.28);
-    }
-
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0,0,w,h);
+    ctx.fillStyle = "white";
+    ctx.font = "22px system-ui, -apple-system, Segoe UI, Roboto";
+    ctx.textAlign = "center";
+    ctx.fillText(state.lives<=0 ? "GAME OVER - Tocca per ricominciare" : "TOCCA PER INIZIARE", w/2, h*0.45);
+    ctx.font = "14px system-ui, -apple-system, Segoe UI, Roboto";
+    ctx.fillText("Trascina per cambiare corsia • Tasti 1/2/3 per skin", w/2, h*0.45 + 28);
     ctx.restore();
   }
+}
 
-  // ===== render
-  function render(){
-    bg();
-    ground();
+// ====== MAIN LOOP ======
+function loop(ts) {
+  if (!lastTs) lastTs = ts;
+  const dt = Math.min(0.033, (ts - lastTs)/1000);
+  lastTs = ts;
 
-    // choice behind obstacles? meglio davanti, così si capisce la scelta
-    // stars
-    for(const s of G.stars) drawStar(s);
+  if (started) update(dt, innerWidth, innerHeight);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
 
-    // bads
-    for(const o of G.bads){
-      if(o.kind==='stain') drawStain(o);
-      else drawReceipt(o);
-    }
+// ====== INPUT ======
+let pointerDown = false;
 
-    // choice
-    if(G.choiceActive){
-      drawChoiceBubble(G.choiceActive.top);
-      drawChoiceBubble(G.choiceActive.low);
-    }
+function startOrRestart() {
+  if (state.lives <= 0) resetGame();
+  started = true;
+}
 
-    // player
-    drawBunny();
+canvas.addEventListener("pointerdown", (e) => {
+  pointerDown = true;
+  canvas.setPointerCapture?.(e.pointerId);
+  if (!started) startOrRestart();
+  // spostamento immediato
+  const x = e.clientX;
+  state.playerLane = nearestLaneAtBottom(x, innerWidth);
+});
 
-    hud();
-  }
+canvas.addEventListener("pointermove", (e) => {
+  if (!pointerDown || !started) return;
+  const x = e.clientX;
+  state.playerLane = nearestLaneAtBottom(x, innerWidth);
+});
 
-  // ===== loop
-  function frame(now){
-    const dt = Math.min(0.033, (now - G.last) / 1000);
-    G.last = now;
+canvas.addEventListener("pointerup", () => pointerDown = false);
+canvas.addEventListener("pointercancel", () => pointerDown = false);
 
-    if(G.state === 'play') update(dt);
-    render();
-
-    requestAnimationFrame(frame);
-  }
-  requestAnimationFrame(frame);
-
-})();
+// tastiera (solo test)
+addEventListener("keydown", (e) => {
+  if (e.key === "ArrowLeft") state.playerLane = clamp(state.playerLane - 1, 0, LANES-1);
+  if (e.key === "ArrowRight") state.playerLane = clamp(state.playerLane + 1, 0, LANES-1);
+  if (e.key === "1") state.playerSkin = "boy";
+  if (e.key === "2") state.playerSkin = "girl";
+  if (e.key === "3") state.playerSkin = "bunny";
+  if (e.key.toLowerCase() === "r") { resetGame(); started = false; }
+});
 </script>
 </body>
 </html>
