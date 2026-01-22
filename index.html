@@ -34,6 +34,15 @@
         linear-gradient(180deg, #fff, #f7fbff);
     }
 
+    #bgCanvas{
+      position:absolute;
+      inset:0;
+      width:100%;
+      height:100%;
+      z-index:0;
+      pointer-events:none;
+    }
+
     /* strobo soft */
     .arena::after{
       content:"";
@@ -233,11 +242,29 @@
       pointer-events:none;
     }
     .hud.on{ opacity:.9; }
+
+    .assetMissing{
+      position:absolute;
+      left:12px; top:10px;
+      padding:4px 8px;
+      border-radius:10px;
+      background:rgba(255,255,255,.75);
+      border:1px solid rgba(0,0,0,.12);
+      font-size:11px;
+      font-weight:900;
+      letter-spacing:.4px;
+      color:#a80000;
+      z-index:30;
+      display:none;
+      pointer-events:none;
+    }
   </style>
 </head>
 
 <body>
   <div class="arena" id="arena">
+    <canvas id="bgCanvas" aria-hidden="true"></canvas>
+    <div class="assetMissing" id="assetMissing">ASSET MANCANTE</div>
     <div class="cloud" style="left:-320px; top:18px; animation-duration: 14s;"></div>
     <div class="cloud" style="left:-380px; top:88px; width:260px; height:78px; opacity:.70; animation-duration: 18s;"></div>
 
@@ -264,6 +291,12 @@
 (() => {
   const $ = (id) => document.getElementById(id);
 
+  const ASSETS = {
+    bgSrc: "assets/bg.jpg",
+    bongSrc: "assets/bong.png",
+    cuffsSrc: "assets/cuffs.png"
+  };
+
   const arena  = $("arena");
   const inner  = $("inner");
   const player = $("player");
@@ -271,8 +304,11 @@
   const hud    = $("hud");
   const scoreEl= $("score");
   const livesEl= $("lives");
+  const bgCanvas = $("bgCanvas");
+  const assetMissingEl = $("assetMissing");
 
   const LANES = 5;
+  const ITEM_SIZE = 96;
 
   // ===== Personaggi: BIMBA + CONIGLIO =====
   const SVG = {
@@ -328,13 +364,11 @@
     bopPlayer();
   }
 
-  // ===== Oggetti (solo testo / emoji) =====
-  // buoni: 🍕 ⭐
-  // cattivo: 👮 (poliziotto "solo testo")
+  // ===== Oggetti (icone dentro bubble) =====
   const ITEMS = [
-    { glyph:"🍕", kind:"good"  },
-    { glyph:"⭐", kind:"bonus" },
-    { glyph:"👮", kind:"bad"   }
+    { icon:"bong",  kind:"good"  },
+    { icon:"star",  kind:"bonus" },
+    { icon:"cuffs", kind:"bad"   }
   ];
 
   // ===== State =====
@@ -349,6 +383,138 @@
   const falling = [];
   let lastSpawnAt = 0;
   let lastTs = 0;
+
+  const bgCtx = bgCanvas.getContext("2d");
+  const bgImg = new Image();
+  const bongImg = new Image();
+  const cuffsImg = new Image();
+  let bgLoaded = false;
+
+  const missingAssets = new Set();
+
+  function markMissing(name){
+    if(missingAssets.has(name)) return;
+    missingAssets.add(name);
+    console.warn(`Missing ${name}`);
+    assetMissingEl.style.display = "block";
+  }
+
+  function loadImageWithFallback(img, src, fallbackSrc, onReady, missingName){
+    img.onload = () => {
+      onReady?.();
+    };
+    img.onerror = () => {
+      if(fallbackSrc && img.dataset.fallbackTried !== "1"){
+        img.dataset.fallbackTried = "1";
+        img.src = fallbackSrc;
+        return;
+      }
+      markMissing(missingName);
+    };
+    img.src = src;
+  }
+
+  function drawBgCover(img){
+    const w = arena.clientWidth;
+    const h = arena.clientHeight;
+    const scale = Math.max(w / img.width, h / img.height);
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+    const dx = (w - drawW) / 2;
+    const dy = (h - drawH) / 2;
+    bgCtx.drawImage(img, dx, dy, drawW, drawH);
+  }
+
+  function resizeBgCanvas(){
+    const w = arena.clientWidth;
+    const h = arena.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    bgCanvas.width = Math.round(w * dpr);
+    bgCanvas.height = Math.round(h * dpr);
+    bgCanvas.style.width = `${w}px`;
+    bgCanvas.style.height = `${h}px`;
+    bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function drawBackground(){
+    resizeBgCanvas();
+    const w = arena.clientWidth;
+    const h = arena.clientHeight;
+    bgCtx.clearRect(0, 0, w, h);
+    if(bgLoaded){
+      drawBgCover(bgImg);
+    }
+  }
+
+  function drawBubble(ctx, cx, cy, r){
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,.18)";
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 6;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,.88)";
+    ctx.fill();
+    ctx.restore();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(0,0,0,.12)";
+    ctx.stroke();
+  }
+
+  function drawIconCover(ctx, img, cx, cy, maxSize){
+    const scale = Math.min(maxSize / img.width, maxSize / img.height);
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+    ctx.drawImage(img, cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+  }
+
+  function drawFallbackLetter(ctx, text, cx, cy, size){
+    ctx.fillStyle = "#1f1f1f";
+    ctx.font = `900 ${Math.round(size)}px ui-rounded, "SF Pro Rounded", system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, cx, cy);
+  }
+
+  function drawItemCanvas(canvas, icon){
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const cx = w / 2;
+    const cy = h / 2;
+    const r = Math.min(w, h) * 0.38;
+    drawBubble(ctx, cx, cy, r);
+    const iconSize = r * 1.25;
+
+    if(icon === "bong"){
+      if(bongImg.complete && bongImg.naturalWidth){
+        drawIconCover(ctx, bongImg, cx, cy, iconSize);
+      } else {
+        drawFallbackLetter(ctx, "B", cx, cy, r * 1.1);
+      }
+      return;
+    }
+    if(icon === "cuffs"){
+      if(cuffsImg.complete && cuffsImg.naturalWidth){
+        drawIconCover(ctx, cuffsImg, cx, cy, iconSize);
+      } else {
+        drawFallbackLetter(ctx, "X", cx, cy, r * 1.1);
+      }
+      return;
+    }
+
+    drawFallbackLetter(ctx, "★", cx, cy, r * 1.05);
+  }
+
+  function redrawFallingItems(){
+    for(const f of falling){
+      const canvas = f.querySelector("canvas");
+      if(canvas){
+        drawItemCanvas(canvas, f.dataset.icon);
+      }
+    }
+  }
 
   // debug HUD toggle
   let hudOn = false;
@@ -434,15 +600,20 @@
 
     // peso: più buoni, meno cattivi
     const r = Math.random();
-    let item = ITEMS[0]; // 🍕
+    let item = ITEMS[0];
     if(r < 0.55) item = ITEMS[0];
-    else if(r < 0.90) item = ITEMS[1]; // ⭐
-    else item = ITEMS[2]; // 👮
+    else if(r < 0.90) item = ITEMS[1];
+    else item = ITEMS[2];
 
     const f = document.createElement("div");
     f.className = "falling";
-    f.textContent = item.glyph;
     f.dataset.kind = item.kind;
+    f.dataset.icon = item.icon;
+    const canvas = document.createElement("canvas");
+    canvas.width = ITEM_SIZE;
+    canvas.height = ITEM_SIZE;
+    drawItemCanvas(canvas, item.icon);
+    f.appendChild(canvas);
 
     // corsia random (5)
     const laneIndex = Math.floor(Math.random() * LANES);
@@ -605,9 +776,39 @@
   });
 
   // INIT
+  drawBackground();
+  loadImageWithFallback(
+    bgImg,
+    ASSETS.bgSrc,
+    ASSETS.bgSrc.endsWith(".jpg") ? ASSETS.bgSrc.replace(".jpg", ".png") : ASSETS.bgSrc.replace(".png", ".jpg"),
+    () => {
+      bgLoaded = true;
+      drawBackground();
+    },
+    "bg"
+  );
+  loadImageWithFallback(
+    bongImg,
+    ASSETS.bongSrc,
+    null,
+    () => {
+      redrawFallingItems();
+    },
+    "bong"
+  );
+  loadImageWithFallback(
+    cuffsImg,
+    ASSETS.cuffsSrc,
+    null,
+    () => {
+      redrawFallingItems();
+    },
+    "cuffs"
+  );
   setCharacter(0);
   placePlayer();
   updateHud();
+  window.addEventListener("resize", drawBackground);
   requestAnimationFrame(tick);
 })();
 </script>
