@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>Porcellino Jump</title>
+  <title>Porcellino Jump • MEME PANICORE</title>
   <style>
     html, body { margin:0; padding:0; height:100%; background:#fff; overflow:hidden; touch-action:manipulation; }
     canvas { display:block; width:100vw; height:100vh; }
@@ -44,7 +44,10 @@
 
   // ---------- ASSETS (metti i file in /assets) ----------
   const ASSETS = {
-    bgSrc:    "assets/bg.jpg",     // oppure assets/bg.png
+    bgSrc:    "assets/bg.jpg",     // sfondo principale
+    worldSrc: "assets/world.png",  // (NUOVO) overlay mondo "meme panicore" - opzionale
+    memeSrc:  "assets/meme.png",   // (NUOVO) logo/icone meme - opzionale
+
     bongSrc:  "assets/bong.png",
     cuffsSrc: "assets/cuffs.png",
   };
@@ -60,10 +63,10 @@
     });
   }
 
-  const IMAGES = { bg:null, bong:null, cuffs:null };
+  const IMAGES = { bg:null, world:null, meme:null, bong:null, cuffs:null };
 
   // cover draw
-  function drawImageCover(img) {
+  function drawImageCover(img, alpha=1) {
     const w = innerWidth, h = innerHeight;
     const iw = img.naturalWidth || img.width;
     const ih = img.naturalHeight || img.height;
@@ -72,7 +75,10 @@
     const dh = ih * s;
     const dx = (w - dw) / 2;
     const dy = (h - dh) / 2;
+    ctx.save();
+    ctx.globalAlpha = alpha;
     ctx.drawImage(img, dx, dy, dw, dh);
+    ctx.restore();
   }
 
   // ---------- Audio (mini) ----------
@@ -108,6 +114,12 @@
     // buchi
     holes: [],
     nextHoleX: 0,
+
+    // (NUOVO) mondo meme panicore: particelle + doodle flottanti
+    sparks: [],
+    doodles: [],
+    doodleTimer: 0,
+    sparkTimer: 0,
   };
 
   // ---------- Style helpers (doodle) ----------
@@ -170,6 +182,12 @@
     pig.y = world.groundY() - pig.r();
     pig.vy = 0;
     pig.onGround = true;
+
+    // (NUOVO) reset mondo
+    world.sparks.length = 0;
+    world.doodles.length = 0;
+    world.doodleTimer = 0.25;
+    world.sparkTimer = 0.08;
   }
 
   // ---------- Items (ORA SOLO BONUS) ----------
@@ -287,6 +305,139 @@
     }
   }
 
+  // ---------- (NUOVO) MONDO MEME PANICORE: particelle & doodle ----------
+  function spawnSpark() {
+    const gy = world.groundY();
+    const y = rand(gy - H()*0.55, gy - H()*0.12);
+    world.sparks.push({
+      x: W() + 20,
+      y,
+      vx: -world.speed * rand(0.8, 1.25),
+      vy: rand(-10, 10),
+      s: rand(2, 6),
+      a: rand(0.18, 0.35),
+      life: rand(0.6, 1.1),
+    });
+  }
+
+  function spawnDoodle() {
+    const kinds = ["!", "?", "♥", "★"];
+    const k = kinds[(Math.random()*kinds.length)|0];
+    world.doodles.push({
+      k,
+      x: W() + rand(0, 120),
+      y: rand(H()*0.10, H()*0.45),
+      vx: -world.speed * rand(0.10, 0.20),
+      rot: rand(-0.3, 0.3),
+      vr: rand(-0.25, 0.25),
+      s: rand(18, 34),
+      a: rand(0.14, 0.22),
+    });
+  }
+
+  function updateMemeWorld(dt) {
+    // sempre leggero, più “panicore” quando vai veloce
+    const panic = Math.max(0, Math.min(1, (world.speed - 340) / 200));
+
+    world.sparkTimer -= dt * (1 + panic*1.8);
+    if (world.sparkTimer <= 0) {
+      spawnSpark();
+      world.sparkTimer = rand(0.05, 0.11);
+    }
+
+    world.doodleTimer -= dt * (1 + panic*1.2);
+    if (world.doodleTimer <= 0) {
+      spawnDoodle();
+      world.doodleTimer = rand(0.45, 0.9);
+    }
+
+    for (const p of world.sparks) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+    }
+    for (let i=world.sparks.length-1; i>=0; i--) {
+      if (world.sparks[i].x < -50 || world.sparks[i].life <= 0) world.sparks.splice(i,1);
+    }
+
+    for (const d of world.doodles) {
+      d.x += d.vx * dt;
+      d.rot += d.vr * dt;
+    }
+    for (let i=world.doodles.length-1; i>=0; i--) {
+      if (world.doodles[i].x < -80) world.doodles.splice(i,1);
+    }
+  }
+
+  function drawMemeWorldLayers() {
+    // overlay "world" (immagine opzionale)
+    if (IMAGES.world) {
+      // leggero, sopra lo sfondo
+      drawImageCover(IMAGES.world, 0.28);
+    }
+
+    // vibe panicore: vignette + glow
+    const panic = Math.max(0, Math.min(1, (world.speed - 340) / 200));
+    ctx.save();
+    // glow rosa/rosso soft
+    ctx.globalAlpha = 0.22 + panic*0.18;
+    const g = ctx.createRadialGradient(W()*0.25, H()*0.35, 10, W()*0.25, H()*0.35, Math.max(W(),H())*0.9);
+    g.addColorStop(0, "rgba(255, 140, 190, 0.55)");
+    g.addColorStop(0.6, "rgba(255, 80, 120, 0.10)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W(),H());
+    ctx.restore();
+
+    // particelle
+    ctx.save();
+    for (const p of world.sparks) {
+      ctx.globalAlpha = p.a * Math.max(0, Math.min(1, p.life));
+      ctx.fillStyle = "#fff";
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = Math.max(2, Math.round(Math.min(W(),H())*0.0028));
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.s, 0, Math.PI*2);
+      ctx.fill();
+      ctx.stroke();
+      // micro scia
+      ctx.globalAlpha *= 0.6;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x + p.s*2.2, p.y + p.s*0.2);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // doodle fluttuanti
+    ctx.save();
+    doodleStroke();
+    for (const d of world.doodles) {
+      ctx.save();
+      ctx.translate(d.x, d.y);
+      ctx.rotate(d.rot);
+      ctx.globalAlpha = d.a;
+      ctx.font = `900 ${d.s}px ui-rounded, system-ui, -apple-system, sans-serif`;
+      ctx.fillStyle = "#fff";
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = Math.max(3, Math.round(Math.min(W(),H())*0.004));
+      ctx.strokeText(d.k, 0, 0);
+      ctx.fillText(d.k, 0, 0);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    // logo meme opzionale in alto a destra
+    if (IMAGES.meme) {
+      const s = Math.max(36, Math.round(Math.min(W(),H())*0.07));
+      const pad = 14;
+      ctx.save();
+      ctx.globalAlpha = 0.92;
+      ctx.drawImage(IMAGES.meme, W()-pad-s, pad, s, s);
+      ctx.restore();
+    }
+  }
+
   // ---------- Background + ground ----------
   function drawGroundWithHoles() {
     doodleStroke();
@@ -329,11 +480,18 @@
 
     // sfondo immagine (se presente)
     if (IMAGES.bg) {
-      drawImageCover(IMAGES.bg);
+      drawImageCover(IMAGES.bg, 1);
     } else {
-      ctx.fillStyle = "#fff";
+      // fallback: gradientino carino
+      const g = ctx.createLinearGradient(0,0,0,H());
+      g.addColorStop(0, "#fff");
+      g.addColorStop(1, "rgba(255, 210, 221, 0.6)");
+      ctx.fillStyle = g;
       ctx.fillRect(0,0,W(),H());
     }
+
+    // (NUOVO) mondo meme panicore sopra lo sfondo
+    drawMemeWorldLayers();
 
     // nuvolette sopra lo sfondo (come prima)
     doodleStroke();
@@ -353,6 +511,20 @@
 
     // terreno con buchi
     drawGroundWithHoles();
+
+    // (NUOVO) etichetta mondo (micro)
+    doodleStroke();
+    const pad = 14;
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.font = `900 ${Math.max(14, Math.round(Math.min(W(),H())*0.022))}px ui-rounded, system-ui, -apple-system, sans-serif`;
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = Math.max(3, Math.round(Math.min(W(),H())*0.004));
+    const txt = "MEME PANICORE";
+    ctx.strokeText(txt, W()-pad, H()-pad);
+    ctx.fillText(txt, W()-pad, H()-pad);
+    ctx.restore();
   }
 
   function drawPig() {
@@ -360,6 +532,21 @@
     const r = pig.r();
     const x = pig.x();
     const y = pig.y;
+
+    // (NUOVO) aura panicore leggerissima dietro al porcellino (solo grafica)
+    const panic = Math.max(0, Math.min(1, (world.speed - 340) / 200));
+    if (panic > 0.02) {
+      ctx.save();
+      ctx.globalAlpha = 0.12 + panic*0.16;
+      const g = ctx.createRadialGradient(x, y, r*0.2, x, y, r*2.2);
+      g.addColorStop(0, "rgba(255, 160, 200, 0.8)");
+      g.addColorStop(1, "rgba(255, 0, 90, 0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, r*2.2, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
 
     // corpo
     ctx.beginPath();
@@ -436,6 +623,9 @@
     world.t += dt;
 
     const gy = world.groundY();
+
+    // (NUOVO) mondo meme panicore: update visual layer
+    updateMemeWorld(dt);
 
     // pig physics
     const g = Math.max(1200, H()*1.6);
@@ -533,6 +723,7 @@
     if (world.state === "ready") {
       centerText("TOCCA PER SALTARE", H()*0.45, 1.15);
       centerText("prendi i bonus in alto • evita i buchi", H()*0.45 + 34, 0.75);
+      centerText("MONDO: MEME PANICORE", H()*0.45 + 62, 0.68);
     }
     if (world.state === "over") {
       centerText("CADUTO!", H()*0.43, 1.2);
@@ -559,6 +750,9 @@
   // ---------- Boot: carica immagini ----------
   (async () => {
     IMAGES.bg = await loadImage(ASSETS.bgSrc);
+    IMAGES.world = await loadImage(ASSETS.worldSrc); // (NUOVO)
+    IMAGES.meme = await loadImage(ASSETS.memeSrc);   // (NUOVO)
+
     IMAGES.bong = await loadImage(ASSETS.bongSrc);
     IMAGES.cuffs = await loadImage(ASSETS.cuffsSrc);
 
